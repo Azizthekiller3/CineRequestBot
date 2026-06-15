@@ -6,7 +6,7 @@ import sys
 from subprocess import Popen
 
 from pyrogram import Client
-from config import API_ID, API_HASH, BOT_TOKEN, SESSION, LOG_CHANNEL, OWNER_ID, RESULTS_CHANNEL
+from config import API_ID, API_HASH, BOT_TOKEN, SESSION, LOG_CHANNEL, RESULTS_CHANNEL
 from database import create_indexes
 
 logging.basicConfig(
@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def _session_name():
+    """Use in-memory session on Railway (ephemeral filesystem)."""
     sessions_dir = os.environ.get("SESSIONS_DIR", "sessions")
     try:
         os.makedirs(sessions_dir, exist_ok=True)
@@ -51,10 +52,10 @@ class Bot(Client):
         if SESSION:
             await _start_user_session()
         else:
-            logger.warning("⚠️  No SESSION set — search will not work.")
+            logger.warning("⚠️  SESSION not set — search will not work. Add SESSION env var.")
 
         if not RESULTS_CHANNEL:
-            logger.warning("⚠️  RESULTS_CHANNEL not set — search results cannot be posted.")
+            logger.warning("⚠️  RESULTS_CHANNEL not set — add it to env vars.")
 
         _start_autodelete_worker()
 
@@ -82,19 +83,19 @@ class Bot(Client):
                     LOG_CHANNEL,
                     f"✅ <b>CineRequestBot Started</b>\n\n"
                     f"🤖 @{me.username} (<code>{me.id}</code>)\n"
-                    f"📺 Results channel: <code>{RESULTS_CHANNEL}</code>",
+                    f"📺 Results channel: <code>{RESULTS_CHANNEL or 'NOT SET'}</code>\n"
+                    f"🔑 Session: {'✅ configured' if SESSION else '❌ missing'}",
                 )
             except Exception:
                 pass
 
     async def stop(self, *args):
-        if SESSION:
-            try:
-                from client import User
-                if User.is_connected:
-                    await User.stop()
-            except Exception:
-                pass
+        try:
+            from client import User
+            if User is not None and User.is_connected:
+                await User.stop()
+        except Exception:
+            pass
         await super().stop()
         logger.info("Bot stopped")
 
@@ -102,18 +103,21 @@ class Bot(Client):
 async def _start_user_session():
     try:
         from client import User
+        if User is None:
+            logger.error("User is None — SESSION env var is set but client failed to init")
+            return
         if not User.is_connected:
             await User.start()
         me = await User.get_me()
-        logger.info("✅ User session: @%s", me.username or me.first_name)
+        logger.info("✅ User session active: @%s (id=%d)", me.username or me.first_name, me.id)
         count = 0
         async for _ in User.get_dialogs():
             count += 1
             if count >= 200:
                 break
-        logger.info("✅ Peer cache warmed (%d dialogs)", count)
+        logger.info("✅ Peer cache warmed (%d dialogs loaded)", count)
     except Exception as e:
-        logger.warning("⚠️  User session failed: %s", e)
+        logger.warning("⚠️  User session failed to start: %s", e)
 
 
 async def _session_watchdog():
@@ -123,13 +127,15 @@ async def _session_watchdog():
             continue
         try:
             from client import User
+            if User is None:
+                continue
             if not User.is_connected:
-                logger.warning("Watchdog: session disconnected — reconnecting")
+                logger.warning("Watchdog: User session disconnected — reconnecting")
                 await _start_user_session()
             else:
                 await User.get_me()
         except Exception as e:
-            logger.warning("Watchdog error: %s", e)
+            logger.warning("Watchdog error: %s — attempting reconnect", e)
             try:
                 await _start_user_session()
             except Exception:
@@ -142,7 +148,7 @@ def _start_autodelete_worker():
         Popen([sys.executable, "-m", "utils.delete"], cwd=bot_dir)
         logger.info("✅ Auto-delete worker started")
     except Exception as e:
-        logger.warning("Auto-delete worker failed: %s", e)
+        logger.warning("Auto-delete worker failed to start: %s", e)
 
 
 async def main():
@@ -156,6 +162,7 @@ async def main():
     stop_event = asyncio.Event()
 
     def _handle_signal():
+        logger.info("Shutdown signal received")
         stop_event.set()
 
     loop = asyncio.get_running_loop()
@@ -165,7 +172,9 @@ async def main():
         except NotImplementedError:
             pass
 
+    logger.info("Bot is running. SIGTERM/Ctrl+C to stop.")
     await stop_event.wait()
+
     watchdog.cancel()
     try:
         await watchdog
